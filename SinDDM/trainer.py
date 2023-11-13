@@ -35,14 +35,15 @@ except:
 class Dataset(data.Dataset):
     def __init__(self, folder, image_size, blurry_img=False, exts=['jpg', 'jpeg', 'png']):
         super().__init__()
-        self.folder = folder
+        self.folder     = folder
         self.image_size = image_size
         self.blurry_img = blurry_img
-        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        self.paths      = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
         if blurry_img:
             self.folder_recon = folder + '_recon/'
-            self.paths_recon = [p for ext in exts for p in Path(f'{self.folder_recon}').glob(f'**/*.{ext}')]
+            self.paths_recon  = [p for ext in exts for p in Path(f'{self.folder_recon}').glob(f'**/*.{ext}')]
 
+        # 没有使用任何复杂的扩充方法
         self.transform = transforms.Compose([
 
             transforms.ToTensor(),
@@ -53,8 +54,10 @@ class Dataset(data.Dataset):
         return len(self.paths) * 128
 
     def __getitem__(self, index):
+        
+        # 只使用一张样本
         path = self.paths[0]
-        img = Image.open(path).convert('RGB')
+        img  = Image.open(path).convert('RGB')
         if self.blurry_img:
             path_recon = self.paths_recon[0]
             img_recon = Image.open(path_recon).convert('RGB')
@@ -81,7 +84,7 @@ class MultiscaleTrainer(object):
             fp16=False,
             step_start_ema=2000,
             update_ema_every=10,
-            save_and_sample_every=25000,
+            save_sample_every=25000,
             avg_window=100,
             sched_milestones=None,
             results_folder='./results',
@@ -101,7 +104,7 @@ class MultiscaleTrainer(object):
         self.update_ema_every = update_ema_every
 
         self.step_start_ema = step_start_ema
-        self.save_and_sample_every = save_and_sample_every
+        self.save_sample_every = save_sample_every
         self.avg_window = avg_window
 
         self.batch_size = train_batch_size
@@ -212,8 +215,8 @@ class MultiscaleTrainer(object):
                 self.step_ema()
             self.scheduler.step()
             self.step += 1
-            if self.step % self.save_and_sample_every == 0:
-                milestone = self.step // self.save_and_sample_every
+            if self.step % self.save_sample_every == 0:
+                milestone = self.step // self.save_sample_every
                 batches = num_to_groups(16, self.batch_size)
                 all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
                 all_images = torch.cat(all_images_list, dim=0)
@@ -257,8 +260,7 @@ class MultiscaleTrainer(object):
         final_img = None
         for i in range(n_scales):
             if start_noise and i == 0:
-                samples_from_scales.append(
-                    self.ema_model.sample(batch_size=batch_size, scale_0_size=scale_0_size, s=custom_scales[i]))
+                samples_from_scales.append(self.ema_model.sample(batch_size=batch_size, scale_0_size=scale_0_size, s=custom_scales[i]))
 
             elif i == 0: # start_noise == False, means injecting the original training image
                 orig_sample_0 = Image.open((self.input_paths[custom_scales[i]] + '/' + image_name)).convert("RGB")
@@ -364,26 +366,27 @@ class MultiscaleTrainer(object):
                       guidance_sub_iters=None, quantile=0.8, stop_guidance=None, save_unbatched=False, scale_mul=(1,1), llambda=0, start_noise=True, image_name=''):
         if guidance_sub_iters is None:
             guidance_sub_iters = [*reversed(range(self.n_scales))]
-        self.ema_model.clip_strength = strength
-        self.ema_model.clip_text = text_input
+        
+        self.ema_model.clip_strength   = strength
+        self.ema_model.clip_text       = text_input
         self.ema_model.text_embedds_hr = clip_model.get_text_embedding(text_input, template=get_augmentations_template('hr'))
         self.ema_model.text_embedds_lr = clip_model.get_text_embedding(text_input, template=get_augmentations_template('lr'))
         self.ema_model.clip_guided_sampling = True
         self.ema_model.guidance_sub_iters = guidance_sub_iters
-        self.ema_model.quantile = quantile
+        self.ema_model.quantile      = quantile
         self.ema_model.stop_guidance = stop_guidance
-        self.ema_model.clip_model = clip_model
-        self.ema_model.clip_score = []
-        self.ema_model.llambda = llambda
+        self.ema_model.clip_model    = clip_model
+        self.ema_model.clip_score    = []
+        self.ema_model.llambda       = llambda
         strength_string = f'{strength}'
-        gsi_string = '_'.join(str(e) for e in guidance_sub_iters)
-        n_aug = self.ema_model.clip_model.cfg["n_aug"]
+        gsi_string      = '_'.join(str(e) for e in guidance_sub_iters)
+        n_aug           = self.ema_model.clip_model.cfg["n_aug"]
         desc = f"clip_{text_input.replace(' ', '_')}_n_aug{n_aug}_str_" + strength_string + "_gsi_" + gsi_string + \
                f'_ff{1-quantile}' + f'_{str(datetime.datetime.now()).replace(":", "_")}'
 
         if not start_noise:  # relevant for mode==clip_style_trans
             # start from last scale
-            custom_scales = [self.n_scales - 2, self.n_scales - 1]
+            custom_scales          = [self.n_scales - 2, self.n_scales - 1]
             custom_image_size_idxs = [self.n_scales - 2, self.n_scales - 1]
             # custom_t_list = [self.ema_model.num_timesteps_ideal[-2], self.ema_model.num_timesteps_ideal[-1]]
             self.sample_scales(scale_mul=scale_mul,  # H,W

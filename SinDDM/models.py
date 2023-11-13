@@ -274,8 +274,7 @@ class MultiScaleGaussianDiffusion(nn.Module):
                 self.num_timesteps_ideal.append(
                     int(np.argmax(sigma_t > loss_factor * scale_losses[i])))
                 if train_full_t:
-                    self.num_timesteps_trained.append(
-                        int(timesteps))
+                    self.num_timesteps_trained.append(int(timesteps))
                 else:
                     self.num_timesteps_trained.append(self.num_timesteps_ideal[i+1])
 
