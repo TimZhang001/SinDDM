@@ -1,0 +1,1 @@
+python main.py --scope mvtec_hazelnut --mode train --augment 1 --device_num 5 --load_milestone 0

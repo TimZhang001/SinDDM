@@ -15,7 +15,7 @@ def parse_args():
     parser.add_argument("--mode",    help='choose mode: train, sample, clip_content, clip_style_gen, clip_style_trans, clip_roi, harmonization, style_transfer, roi', 
                         default='train')
     
-    parser.add_argument("--augment", help='use data augmentation.', default=0)
+    parser.add_argument("--augment", help='use data augmentation.', default=1)
     
     # --------------------------------------------------------------------------------------------------
     # relevant if mode==hamonization/style_transfer
@@ -63,7 +63,7 @@ def parse_args():
     parser.add_argument("--scale_mul",         help='image size retargeting modifier.', nargs="+", default=[1, 1], type=float)
     parser.add_argument("--sample_t_list",     nargs="+", help='Custom list of timesteps corresponding to each scale (except scale 0).', type=int)
     # device num
-    parser.add_argument("--device_num",        help='use specific cuda device.', default=5, type=int)
+    parser.add_argument("--device_num",        help='use specific cuda device.', default=0, type=int)
 
     # DEV. params - do not modify
     parser.add_argument("--sample_limited_t", help='limit t in each scale to stop at the start of the next scale', action='store_true')

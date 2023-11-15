@@ -62,7 +62,7 @@ class Dataset(data.Dataset):
         img  = Image.open(path).convert('RGB')
         if self.blurry_img:
             path_recon = self.paths_recon[0]
-            img_recon = Image.open(path_recon).convert('RGB')
+            img_recon  = Image.open(path_recon).convert('RGB')
             return self.transform(img), self.transform(img_recon)
         # else
         return self.transform(img)
@@ -208,22 +208,39 @@ class MultiscaleTrainer(object):
         self.augment_fun = albumentations.Compose([aug_flip, aug_rotate90, aug_scaleRotate, aug_brightness_contrast])
     
     
-    def augment(self, batch_data):
+    def image_augment(self, batch_data):
         
+        out_data    = []
+        image_list1 = []
+        image_list2 = []
+
         # batch size
         for i in range(batch_data[0].shape[0]):
-            # 转化为numpy  处理
-            image1    = np.transpose(batch_data[0][i].cpu().numpy(), (1, 2, 0))
-            image2    = np.transpose(batch_data[1][i].cpu().numpy(), (1, 2, 0))
+            image1 = batch_data[0][i].detach().clone()
+            image2 = batch_data[1][i].detach().clone()
+            
+            # 转化为numpy  [-1, 1] -- > [0, 1]处理
+            image1 = np.transpose(image1.cpu().numpy(), (1, 2, 0))
+            image2 = np.transpose(image2.cpu().numpy(), (1, 2, 0))
+            image1 = (image1 + 1) * 0.5
+            image2 = (image2 + 1) * 0.5
+            
+            # 进行数据增强
             processed = self.augment_fun(image = image1, mask=image2)
             
-            # 转换为tensor
-            image1           = torch.from_numpy(np.transpose(processed['image'], (2, 0, 1))).to(self.device)
-            image2           = torch.from_numpy(np.transpose(processed['mask'], (2, 0, 1))).to(self.device)
-            batch_data[0][i] = image1.clone()
-            batch_data[1][i] = image2.clone()
+            # [0, 1] --> [-1, 1]
+            image1 = (processed['image'] * 2) - 1
+            image2 = (processed['mask'] * 2) - 1
+            image1 = torch.from_numpy(np.transpose(image1, (2, 0, 1))).to(self.device)
+            image2 = torch.from_numpy(np.transpose(image2, (2, 0, 1))).to(self.device)
+            
+            image_list1.append(image1)
+            image_list2.append(image2)
+        
+        out_data.append(torch.stack(image_list1))
+        out_data.append(torch.stack(image_list2))
 
-        return batch_data
+        return out_data
 
     def train(self, augment=False):
 
@@ -237,7 +254,7 @@ class MultiscaleTrainer(object):
             for i in range(self.gradient_accumulate_every):
                 input_data = self.data_list[s]
                 if augment:
-                    aug_data   = self.augment(input_data)
+                    aug_data   = self.image_augment(input_data)
                     loss       = self.model(aug_data, s)
                 else:
                     loss = self.model(input_data, s)
