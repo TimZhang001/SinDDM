@@ -101,7 +101,7 @@ class SinDDMNet(nn.Module):
             time_dim = 32
 
             if multiscale:
-                self.SinEmbTime = SinusoidalPosEmb(time_dim)
+                self.SinEmbTime  = SinusoidalPosEmb(time_dim)
                 self.SinEmbScale = SinusoidalPosEmb(time_dim)
                 self.time_mlp = nn.Sequential(
                     nn.Linear(time_dim * 2, time_dim * 4),
@@ -271,8 +271,7 @@ class MultiScaleGaussianDiffusion(nn.Module):
         # flag to force training of all the timesteps across all scales
         if scale_losses is not None:
             for i in range(n_scales - 1):
-                self.num_timesteps_ideal.append(
-                    int(np.argmax(sigma_t > loss_factor * scale_losses[i])))
+                self.num_timesteps_ideal.append(int(np.argmax(sigma_t > loss_factor * scale_losses[i])))
                 if train_full_t:
                     self.num_timesteps_trained.append(int(timesteps))
                 else:

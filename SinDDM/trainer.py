@@ -6,6 +6,8 @@ https://github.com/lucidrains/denoising-diffusion-pytorch
 import copy
 import os
 import datetime
+import albumentations
+
 from functools import partial
 
 from SinDDM.functions import *
@@ -98,25 +100,25 @@ class MultiscaleTrainer(object):
             self.sched_milestones = sched_milestones
         if image_sizes is None:
             image_sizes = []
-        self.model = ms_diffusion_model
-        self.ema = EMA(ema_decay)
+        self.model     = ms_diffusion_model
+        self.ema       = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
 
-        self.step_start_ema = step_start_ema
+        self.step_start_ema    = step_start_ema
         self.save_sample_every = save_sample_every
-        self.avg_window = avg_window
+        self.avg_window        = avg_window
 
-        self.batch_size = train_batch_size
-        self.n_scales = n_scales
+        self.batch_size   = train_batch_size
+        self.n_scales     = n_scales
         self.scale_factor = scale_factor
-        self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
-
+        self.gradient_accumulate_every = gradient_accumulate_every
+        
         self.input_paths = []
-        self.ds_list = []
-        self.dl_list = []
-        self.data_list = []
+        self.ds_list     = []
+        self.dl_list     = []
+        self.data_list   = []
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(parents=True, exist_ok=True)
 
@@ -124,24 +126,22 @@ class MultiscaleTrainer(object):
             self.input_paths.append(folder + 'scale_' + str(i))
             blurry_img = True if i > 0 else False
             self.ds_list.append(Dataset(self.input_paths[i], image_sizes[i], blurry_img))
-            self.dl_list.append(
-                cycle(data.DataLoader(self.ds_list[i], batch_size=train_batch_size, shuffle=True, pin_memory=True)))
+            self.dl_list.append(cycle(data.DataLoader(self.ds_list[i], batch_size=train_batch_size, shuffle=True, pin_memory=True)))
 
             if i > 0:
                 Data = next(self.dl_list[i])
                 self.data_list.append((Data[0].to(self.device), Data[1].to(self.device)))
             else:
-                self.data_list.append(
-                    (next(self.dl_list[i]).to(self.device), next(self.dl_list[i]).to(self.device)))  # just duplicate orig over blurry_img for scale 0
+                # just duplicate orig over blurry_img for scale 0
+                self.data_list.append((next(self.dl_list[i]).to(self.device), next(self.dl_list[i]).to(self.device)))  
 
-        self.opt = Adam(ms_diffusion_model.parameters(), lr=train_lr)
-
+        self.opt       = Adam(ms_diffusion_model.parameters(), lr=train_lr)
         self.scheduler = MultiStepLR(self.opt, milestones=self.sched_milestones, gamma=0.5)
 
-        self.step = 0
-        self.running_loss = []
+        self.step          = 0
+        self.running_loss  = []
         self.running_scale = []
-        self.avg_t = []
+        self.avg_t         = []
 
         assert not fp16 or fp16 and APEX_AVAILABLE, 'Apex must be installed in order for mixed precision training to be turned on'
 
@@ -151,6 +151,7 @@ class MultiscaleTrainer(object):
                                                                     opt_level='O1')
 
         self.reset_parameters()
+        self.get_augmentations()
 
     def reset_parameters(self):
         self.ema_model.load_state_dict(self.model.state_dict())
@@ -189,18 +190,57 @@ class MultiscaleTrainer(object):
         self.running_loss = data['running_loss']
     #    self.running_scale = data['running_scale']
 
-    def train(self):
+    def get_augmentations(self):
+
+        # 进行水平翻转
+        aug_flip = albumentations.Compose([albumentations.VerticalFlip(p=0.5), albumentations.HorizontalFlip(p=0.5),])
+        
+        # 90度旋转
+        aug_rotate90 = albumentations.RandomRotate90(p=0.5)
+
+        # 随机旋转
+        aug_scaleRotate = albumentations.ShiftScaleRotate(shift_limit=0.10, scale_limit=0.10, rotate_limit=45, p=0.5)
+
+        # 亮度拉升
+        aug_brightness_contrast = albumentations.RandomBrightnessContrast(brightness_limit=0.05, contrast_limit=0.05, p=0.5)
+        
+        # 组合
+        self.augment_fun = albumentations.Compose([aug_flip, aug_rotate90, aug_scaleRotate, aug_brightness_contrast])
+    
+    
+    def augment(self, batch_data):
+        
+        # batch size
+        for i in range(batch_data[0].shape[0]):
+            # 转化为numpy  处理
+            image1    = np.transpose(batch_data[0][i].cpu().numpy(), (1, 2, 0))
+            image2    = np.transpose(batch_data[1][i].cpu().numpy(), (1, 2, 0))
+            processed = self.augment_fun(image = image1, mask=image2)
+            
+            # 转换为tensor
+            image1           = torch.from_numpy(np.transpose(processed['image'], (2, 0, 1))).to(self.device)
+            image2           = torch.from_numpy(np.transpose(processed['mask'], (2, 0, 1))).to(self.device)
+            batch_data[0][i] = image1.clone()
+            batch_data[1][i] = image2.clone()
+
+        return batch_data
+
+    def train(self, augment=False):
 
         backwards = partial(loss_backwards, self.fp16)
-        loss_avg = 0
+        loss_avg  = 0
         s_weights = torch.tensor(self.model.num_timesteps_trained, device=self.device, dtype=torch.float)
         while self.step < self.train_num_steps:
 
             # t weighted multinomial sampling
             s = torch.multinomial(input=s_weights, num_samples=1)  # uniform when train_full_t = True
             for i in range(self.gradient_accumulate_every):
-                data = self.data_list[s]
-                loss = self.model(data, s)
+                input_data = self.data_list[s]
+                if augment:
+                    aug_data   = self.augment(input_data)
+                    loss       = self.model(aug_data, s)
+                else:
+                    loss = self.model(input_data, s)
                 loss_avg += loss.item()
                 backwards(loss / self.gradient_accumulate_every, self.opt)
 
@@ -217,7 +257,7 @@ class MultiscaleTrainer(object):
             self.step += 1
             if self.step % self.save_sample_every == 0:
                 milestone = self.step // self.save_sample_every
-                batches = num_to_groups(16, self.batch_size)
+                batches   = num_to_groups(16, self.batch_size)
                 all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
                 all_images = torch.cat(all_images_list, dim=0)
                 all_images = (all_images + 1) * 0.5
