@@ -59,11 +59,22 @@ class SinDDMConvBlock(nn.Module):
 
         self.time_reshape = nn.Conv2d(time_emb_dim, dim, 1)
         self.ds_conv = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, dim_out * mult, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(dim_out * mult, dim_out, 3, padding=1)
-        )
+        
+        if 1:
+            self.net = nn.Sequential(
+                nn.Conv2d(dim, dim_out * mult, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(dim_out * mult, dim_out, 3, padding=1)
+            )
+        else:
+            # 使用更大的感受野
+            self.net = nn.Sequential(
+                nn.Conv2d(dim, dim_out * mult, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(dim_out * mult, dim_out*mult, 5, padding=2),
+                nn.GELU(),
+                nn.Conv2d(dim_out * mult, dim_out, 3, padding=1)
+            )
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb=None):

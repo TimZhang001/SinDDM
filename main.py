@@ -13,7 +13,7 @@ def parse_args():
 
     parser.add_argument("--scope",   help='choose training scope.', default='mvtec_hazelnut')
     parser.add_argument("--mode",    help='choose mode: train, sample, clip_content, clip_style_gen, clip_style_trans, clip_roi, harmonization, style_transfer, roi', 
-                        default='train')
+                        default='sample')
     
     parser.add_argument("--augment", help='use data augmentation.', default=1)
     
@@ -50,13 +50,13 @@ def parse_args():
     parser.add_argument("--timesteps",        help='total diffusion timesteps.',  default=100, type=int)
     parser.add_argument("--train_batch_size", help='batch size during training.', default=32,  type=int)
     parser.add_argument("--grad_accumulate",  help='gradient accumulation (bigger batches).', default=1, type=int)
-    parser.add_argument("--train_num_steps",  help='total training steps.', default=40001, type=int)  # 120001
+    parser.add_argument("--train_num_steps",  help='total training steps.',       default=120001, type=int)  # 120001
     parser.add_argument("--save_sample_every",help='n. steps for checkpointing model.', default=1000, type=int) # 10000
     parser.add_argument("--avg_window",       help='window size for averaging loss (visualization only).', default=100, type=int)
     parser.add_argument("--train_lr",         help='starting lr.', default=1e-3, type=float)
     parser.add_argument("--sched_k_milestones", nargs="+", help='lr scheduler steps x 1000.',
                         default=[20, 40, 70, 80, 90, 110], type=int)
-    parser.add_argument("--load_milestone", help='load specific milestone.', default=0, type=int)
+    parser.add_argument("--load_milestone", help='load specific milestone.', default=40, type=int)
     
     # sampling params
     parser.add_argument("--sample_batch_size", help='batch size during sampling.', default=16, type=int)
@@ -72,8 +72,13 @@ def parse_args():
 
     args = parser.parse_args()
 
-    return args
+    # 对args的参数进行打印
+    print('-----------------args-------------------')
+    for k, v in vars(args).items():
+        print(k, ':', v)
+    print('----------------------------------------')
 
+    return args
 
 
 def main():
@@ -82,7 +87,7 @@ def main():
     args      = parse_args()
     device    = f"cuda:{args.device_num}"
     scale_mul = (args.scale_mul[0], args.scale_mul[1])
-    sched_milestones = [val * 300 for val in args.sched_k_milestones] # 1000
+    sched_milestones = [val * 1000 for val in args.sched_k_milestones] # 1000
     results_folder   = args.results_folder + '/' + args.scope
 
     # set to true to save all intermediate diffusion timestep results

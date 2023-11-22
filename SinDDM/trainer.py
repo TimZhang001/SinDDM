@@ -12,6 +12,7 @@ from functools import partial
 
 from SinDDM.functions import *
 from SinDDM.models import EMA
+from third_party.tim.cutpaste import CutPasteTensor
 
 from torch.utils import data
 from torchvision import transforms, utils
@@ -151,7 +152,8 @@ class MultiscaleTrainer(object):
                                                                     opt_level='O1')
 
         self.reset_parameters()
-        self.get_augmentations()
+        self.get_image_augmentations()
+        self.get_tensor_augmentations()
 
     def reset_parameters(self):
         self.ema_model.load_state_dict(self.model.state_dict())
@@ -190,7 +192,7 @@ class MultiscaleTrainer(object):
         self.running_loss = data['running_loss']
     #    self.running_scale = data['running_scale']
 
-    def get_augmentations(self):
+    def get_image_augmentations(self):
 
         # 进行水平翻转
         aug_flip = albumentations.Compose([albumentations.VerticalFlip(p=0.5), albumentations.HorizontalFlip(p=0.5),])
@@ -203,10 +205,24 @@ class MultiscaleTrainer(object):
 
         # 亮度拉升
         aug_brightness_contrast = albumentations.RandomBrightnessContrast(brightness_limit=0.05, contrast_limit=0.05, p=0.5)
+
+        # ColorJitter
+        aug_colorJitter = albumentations.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1, p=0.5)
+
+        # HueSaturationValue
+        #aug_hueSat      = albumentations.HueSaturationValue(p=0.5)
+
+        # RGBShift
+        #aug_rgbShift    = albumentations.RGBShift(r_shift_limit=10, g_shift_limit=10, b_shift_limit=10, p=0.5)
         
         # 组合
-        self.augment_fun = albumentations.Compose([aug_flip, aug_rotate90, aug_scaleRotate, aug_brightness_contrast])
+        self.augment_fun = albumentations.Compose([aug_flip, aug_rotate90, aug_scaleRotate, aug_brightness_contrast, 
+                                                   aug_colorJitter])
     
+    def get_tensor_augmentations(self):
+        self.cutpaste     = CutPasteTensor()
+        self.base_augment = transforms.Compose([transforms.RandomHorizontalFlip(p=1.0), 
+                                                transforms.RandomVerticalFlip(p=0.0),])
     
     def image_augment(self, batch_data):
         
@@ -254,10 +270,9 @@ class MultiscaleTrainer(object):
             for i in range(self.gradient_accumulate_every):
                 input_data = self.data_list[s]
                 if augment:
-                    aug_data   = self.image_augment(input_data)
-                    loss       = self.model(aug_data, s)
-                else:
-                    loss = self.model(input_data, s)
+                    input_data   = self.image_augment(input_data)
+                
+                loss      = self.model(input_data, s)
                 loss_avg += loss.item()
                 backwards(loss / self.gradient_accumulate_every, self.opt)
 
@@ -273,12 +288,19 @@ class MultiscaleTrainer(object):
             self.scheduler.step()
             self.step += 1
             if self.step % self.save_sample_every == 0:
-                milestone = self.step // self.save_sample_every
-                batches   = num_to_groups(16, self.batch_size)
-                all_images_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
-                all_images = torch.cat(all_images_list, dim=0)
-                all_images = (all_images + 1) * 0.5
-                utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow=4)
+                milestone     = self.step // self.save_sample_every
+                batches       = num_to_groups(16, self.batch_size)
+                images_list   = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
+                milestone_str = str(milestone).zfill(6)
+                
+                # -----------------------------------------------
+                all_images  = torch.cat(images_list, dim=0)
+                all_images  = (all_images + 1) * 0.5
+                utils.save_image(all_images, str(self.results_folder / f'sample-{milestone_str}.png'), nrow=4)
+                
+                input_images= (input_data[0] + 1) * 0.5
+                utils.save_image(input_images, str(self.results_folder / f'input-{milestone_str}.png'), nrow=4)
+                
                 self.save(milestone)
 
         print('training completed')
@@ -325,6 +347,13 @@ class MultiscaleTrainer(object):
                 samples_from_scales.append((transforms.ToTensor()(orig_sample_0) * 2 - 1).repeat(batch_size, 1, 1, 1).to(self.device))
 
             else:
+                if i == 2:
+                    aug_samples, _, _        = self.cutpaste(samples_from_scales[i-1])
+                    #aug_samples              = self.base_augment(samples_from_scales[i-1])
+                    samples_from_scales[i-1] = aug_samples.clone()
+                    final_img                = (aug_samples + 1) * 0.5
+                    utils.save_image(final_img, str(final_results_folder / res_sub_folder) + f'_out_s{i-1}_{desc}_sm_{scale_mul[0]}_{scale_mul[1]}_cutpaste.png', nrow=4)
+
                 samples_from_scales.append(self.ema_model.sample_via_scale(batch_size,
                                                                            samples_from_scales[i - 1],
                                                                            s=custom_scales[i],
@@ -334,7 +363,6 @@ class MultiscaleTrainer(object):
                                                                            custom_t=custom_t_list[int(custom_scales[i])-1],
                                                                            ))
             final_img = (samples_from_scales[i] + 1) * 0.5
-
             utils.save_image(final_img, str(final_results_folder / res_sub_folder) + f'_out_s{i}_{desc}_sm_{scale_mul[0]}_{scale_mul[1]}.png', nrow=4)
 
         if save_unbatched:
