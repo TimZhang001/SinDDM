@@ -153,7 +153,7 @@ class CutPasteTensor(object):
         area_ratio (list): list with 2 floats for maximum and minimum area to cut out
         aspect_ratio (float): minimum area ration. Ration is sampled between aspect_ratio and 1/aspect_ratio.
     """
-    def __init__(self, area_ratio=[0.05,0.20], aspect_ratio=0.3, **kwags):
+    def __init__(self, area_ratio=[0.05,0.10], aspect_ratio=0.3, **kwags):
         super(CutPasteTensor, self).__init__(**kwags)
         self.area_ratio   = area_ratio
         self.aspect_ratio = aspect_ratio

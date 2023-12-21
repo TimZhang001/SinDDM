@@ -11,11 +11,11 @@ from text2live_util.clip_extractor import ClipExtractor
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--scope",   help='choose training scope.', default='mvtec_hazelnut')
+    parser.add_argument("--scope",   help='choose training scope.', default='mvtec_grid')
     parser.add_argument("--mode",    help='choose mode: train, sample, clip_content, clip_style_gen, clip_style_trans, clip_roi, harmonization, style_transfer, roi', 
-                        default='sample')
+                        default='train')
     
-    parser.add_argument("--augment", help='use data augmentation.', default=1)
+    parser.add_argument("--augment", help='use data augmentation.', default=0)
     
     # --------------------------------------------------------------------------------------------------
     # relevant if mode==hamonization/style_transfer
@@ -35,10 +35,9 @@ def parse_args():
     parser.add_argument("--roi_n_tar",   help='Defines the number of target ROIs in the new image.', default=1, type=int)
     # --------------------------------------------------------------------------------------------------
 
-
     # Dataset
-    parser.add_argument("--dataset_folder", help='choose dataset folder.', default='./datasets/mvtec/hazelnut/')
-    parser.add_argument("--image_name",     help='choose image name.',     default='hazelnut_crack_004.png')
+    parser.add_argument("--dataset_folder", help='choose dataset folder.', default='./datasets/mvtec/grid/bent/')
+    parser.add_argument("--image_name",     help='choose image name.',     default=None)
     parser.add_argument("--results_folder", help='choose results folder.', default='./results/')
     parser.add_argument("--image_size",     help='choose image size.',     default=[256, 256])
 
@@ -56,14 +55,14 @@ def parse_args():
     parser.add_argument("--train_lr",         help='starting lr.', default=1e-3, type=float)
     parser.add_argument("--sched_k_milestones", nargs="+", help='lr scheduler steps x 1000.',
                         default=[20, 40, 70, 80, 90, 110], type=int)
-    parser.add_argument("--load_milestone", help='load specific milestone.', default=40, type=int)
+    parser.add_argument("--load_milestone", help='load specific milestone.', default=0, type=int)
     
     # sampling params
     parser.add_argument("--sample_batch_size", help='batch size during sampling.', default=16, type=int)
     parser.add_argument("--scale_mul",         help='image size retargeting modifier.', nargs="+", default=[1, 1], type=float)
     parser.add_argument("--sample_t_list",     nargs="+", help='Custom list of timesteps corresponding to each scale (except scale 0).', type=int)
     # device num
-    parser.add_argument("--device_num",        help='use specific cuda device.', default=0, type=int)
+    parser.add_argument("--device_num",        help='use specific cuda device.', default=5, type=int)
 
     # DEV. params - do not modify
     parser.add_argument("--sample_limited_t", help='limit t in each scale to stop at the start of the next scale', action='store_true')
@@ -77,6 +76,13 @@ def parse_args():
     for k, v in vars(args).items():
         print(k, ':', v)
     print('----------------------------------------')
+
+    # args的参数保存到文件中
+    save_path = os.path.join(args.results_folder, args.scope)
+    os.makedirs(save_path, exist_ok=True)
+    with open(os.path.join(save_path, 'args.txt'), 'w') as f:
+        for k, v in vars(args).items():
+            f.write(str(k) + ':' + str(v) + '\n')
 
     return args
 
@@ -93,18 +99,20 @@ def main():
     # set to true to save all intermediate diffusion timestep results
     save_interm    = False
     save_unbatched = False
+    channels       = 3
 
     sizes, rescale_losses, scale_factor, n_scales = create_img_scales(args.dataset_folder, args.image_name,
                                                                       scale_factor=args.scale_factor,
                                                                       image_size=args.image_size,
                                                                       create=True,
-                                                                      auto_scale=50000, # limit max number of pixels in image
+                                                                      auto_scale=500000, # limit max number of pixels in image
                                                                       )
 
     model = SinDDMNet(
         dim=args.dim,
         multiscale=True,
-        device=device
+        device=device,
+        channels=channels,
     )
     model.to(device)
 
@@ -116,7 +124,7 @@ def main():
         scale_factor=scale_factor,
         image_sizes=sizes,
         scale_mul=scale_mul,
-        channels=3,
+        channels=channels,
         timesteps=args.timesteps,
         train_full_t=True,
         scale_losses=rescale_losses,
@@ -126,7 +134,7 @@ def main():
         device=device,
         reblurring=True,
         sample_limited_t=args.sample_limited_t,
-        omega=args.omega
+        omega=args.omega,
 
     ).to(device)
 
@@ -152,7 +160,6 @@ def main():
             sched_milestones=sched_milestones,
             results_folder=results_folder,
             device=device,
-
         )
 
     if args.load_milestone > 0:

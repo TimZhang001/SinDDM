@@ -4,16 +4,16 @@ https://github.com/lucidrains/denoising-diffusion-pytorch
 """
 
 from SinDDM.functions import *
-import math
-
 from torch import nn
-from einops import rearrange
+import math
 from functools import partial
 import torch.nn.functional as F
 from torchvision import utils
 from matplotlib import pyplot as plt
 from tqdm import tqdm
-
+from einops import rearrange
+from SinDDM.utils.modules import ConvNextBlock, Residual, PreNorm, Attention, LinearAttention, Upsample, Downsample
+from SinDDM.utils.resize_right import resize
 
 class EMA():
     def __init__(self, beta):
@@ -30,7 +30,7 @@ class EMA():
             return new
         return old * self.beta + (1 - self.beta) * new
 
-
+# ---------------理论感受野为35*35------------------#
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -45,9 +45,7 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
 
-
 # building block modules
-
 class SinDDMConvBlock(nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim=None, mult=1):
         super().__init__()
@@ -59,22 +57,12 @@ class SinDDMConvBlock(nn.Module):
 
         self.time_reshape = nn.Conv2d(time_emb_dim, dim, 1)
         self.ds_conv = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
-        
-        if 1:
-            self.net = nn.Sequential(
-                nn.Conv2d(dim, dim_out * mult, 3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(dim_out * mult, dim_out, 3, padding=1)
-            )
-        else:
-            # 使用更大的感受野
-            self.net = nn.Sequential(
-                nn.Conv2d(dim, dim_out * mult, 3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(dim_out * mult, dim_out*mult, 5, padding=2),
-                nn.GELU(),
-                nn.Conv2d(dim_out * mult, dim_out, 3, padding=1)
-            )
+    
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, dim_out * mult, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(dim_out * mult, dim_out, 3, padding=1)
+        )
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb=None):
@@ -89,10 +77,8 @@ class SinDDMConvBlock(nn.Module):
 
         h = self.net(h)
         return h + self.res_conv(x)
-
-
+    
 # denoiser model
-
 class SinDDMNet(nn.Module):
     def __init__(
             self,
@@ -132,10 +118,10 @@ class SinDDMNet(nn.Module):
 
         half_dim = int(dim / 2)
 
-        self.l1 = SinDDMConvBlock(channels, half_dim, time_emb_dim=time_dim)
-        self.l2 = SinDDMConvBlock(half_dim, dim, time_emb_dim=time_dim)
-        self.l3 = SinDDMConvBlock(dim, dim, time_emb_dim=time_dim)
-        self.l4 = SinDDMConvBlock(dim, half_dim, time_emb_dim=time_dim)
+        self.l1 = SinDDMConvBlock(channels, half_dim, time_emb_dim=time_dim) # 
+        self.l2 = SinDDMConvBlock(half_dim, dim,      time_emb_dim=time_dim)
+        self.l3 = SinDDMConvBlock(dim,      dim,      time_emb_dim=time_dim)
+        self.l4 = SinDDMConvBlock(dim,      half_dim, time_emb_dim=time_dim)
 
         out_dim = default(out_dim, channels)
         self.final_conv = nn.Sequential(
@@ -161,8 +147,318 @@ class SinDDMNet(nn.Module):
 
         return self.final_conv(x)
 
+# --------------理论感受野为1+(N*10)--------------------#
+# N=16 时，理论感受野为161，实际距离比较远的位置作用很小
+class NextNet(nn.Module):
+    """
+    A backbone model comprised of a chain of ConvNext blocks, with skip connections.
+    The skip connections are connected similar to a "U-Net" structure (first to last, middle to middle, etc).
+    """
+    def __init__(self, in_channels=3, out_channels=3, depth=16, filters_per_layer=64, device=None):
+        """
+        Args:
+            in_channels (int):
+                Number of input image channels.
+            out_channels (int):
+                Number of network output channels.
+            depth (int):
+                Number of ConvNext blocks in the network.
+            filters_per_layer (int):
+                Base dimension in each ConvNext block.
+        """
+        super().__init__()
+
+        if isinstance(filters_per_layer, (list, tuple)):
+            dims = filters_per_layer
+        else:
+            dims = [filters_per_layer] * depth
+
+        time_dim    = dims[0]
+        emb_dim     = time_dim
+        self.depth  = 16
+        self.layers = nn.ModuleList([])
+        self.device = device
+
+        # First block doesn't have a normalization layer
+        self.layers.append(ConvNextBlock(in_channels, dims[0], emb_dim=emb_dim, norm=False))
+
+        for i in range(1, math.ceil(self.depth / 2)):
+            self.layers.append(ConvNextBlock(dims[i - 1], dims[i], emb_dim=emb_dim, norm=True))
+        for i in range(math.ceil(self.depth / 2), depth):
+            self.layers.append(ConvNextBlock(2 * dims[i - 1],  dims[i], emb_dim=emb_dim, norm=True))
+
+        # After all blocks, do a 1x1 conv to get the required amount of output channels
+        self.final_conv = nn.Conv2d(dims[depth - 1], out_channels, 1)
+
+        # Encoder for positional embedding of timestep
+        self.SinEmbTime  = SinusoidalPosEmb(time_dim)
+        self.SinEmbScale = SinusoidalPosEmb(time_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim * 2, time_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_dim * 4, time_dim)
+        )
+
+    def forward(self, x, time, scale=None):
+
+        scale_tensor = torch.ones(size=time.shape).to(device=self.device) * scale
+        t = self.SinEmbTime(time)
+        s = self.SinEmbScale(scale_tensor)
+        t_s_vec  = torch.cat((t, s), dim=1)
+        cond_vec = self.time_mlp(t_s_vec)
+        
+        residuals = []
+        for layer in self.layers[0: math.ceil(self.depth / 2)]:
+            x = layer(x, cond_vec)
+            residuals.append(x)
+
+        for layer in self.layers[math.ceil(self.depth / 2) : self.depth]:
+            x = torch.cat((x, residuals.pop()), dim=1)
+            x = layer(x, cond_vec)
+        x = self.final_conv(x)
+
+        return x
+    
+# --------------使用Unet结构，使用了Downsample和Attention 不存在感受野问题------------------#
+class Unet(nn.Module):
+    def __init__(
+        self,
+        dim,
+        out_dim = None,
+        dim_mults=(1, 2, 4, 8),
+        channels = 3,
+        device = None,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.device   = device
+
+        dims     = [channels, *map(lambda m: dim * m, dim_mults)]
+        in_out   = list(zip(dims[:-1], dims[1:]))
+        time_dim = dim
+
+        self.downs = nn.ModuleList([])
+        self.ups   = nn.ModuleList([])
+        num_resolutions = len(in_out)
+
+        # ---- Downsampling blocks ----
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.downs.append(nn.ModuleList([
+                ConvNextBlock(dim_in, dim_out, emb_dim=time_dim, norm =ind != 0),
+                ConvNextBlock(dim_out, dim_out, emb_dim=time_dim),
+                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Downsample(dim_out) if not is_last else nn.Identity()
+            ]))
+
+        # ---- Middle block ----
+        mid_dim = dims[-1]
+        self.mid_block1 = ConvNextBlock(mid_dim, mid_dim, emb_dim=time_dim)
+        self.mid_attn   = Residual(PreNorm(mid_dim, Attention(mid_dim, heads=4, dim_head=32)))
+        self.mid_block2 = ConvNextBlock(mid_dim, mid_dim, emb_dim=time_dim)
+
+        # ---- Upsampling blocks ----
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.ups.append(nn.ModuleList([
+                ConvNextBlock(dim_out * 2, dim_in, emb_dim=time_dim),
+                ConvNextBlock(dim_in, dim_in, emb_dim=time_dim),
+                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Upsample(dim_in) if not is_last else nn.Identity()
+            ]))
+
+        # ---- Final convolutions ----
+        out_dim = default(out_dim, channels)
+        self.final_conv = nn.Sequential(
+            ConvNextBlock(dim, dim),
+            nn.Conv2d(dim, out_dim, 1)
+        )
+
+        # Encoder for positional embedding of timestep
+        self.SinEmbTime  = SinusoidalPosEmb(time_dim)
+        self.SinEmbScale = SinusoidalPosEmb(time_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_dim * 2, time_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_dim * 4, time_dim)
+        )
+
+    def forward(self, x, time, scale=None):
+        
+        scale_tensor = torch.ones(size=time.shape).to(device=self.device) * scale
+        t = self.SinEmbTime(time)
+        s = self.SinEmbScale(scale_tensor)
+        t_s_vec  = torch.cat((t, s), dim=1)
+        cond_vec = self.time_mlp(t_s_vec)
+
+        initial_shape = x.shape[-2:]
+        h = []
+        for convnext, convnext2, attn, downsample in self.downs:
+            x = convnext(x, cond_vec)
+            x = convnext2(x, cond_vec)
+            x = attn(x)
+            h.append(x)
+            x = downsample(x)
+
+        x = self.mid_block1(x, cond_vec)
+        x = self.mid_attn(x)
+        x = self.mid_block2(x, cond_vec)
+
+        for convnext, convnext2, attn, upsample in self.ups:
+            res = h.pop()
+            x_resize = resize(x, out_shape=res.shape[-2:])
+            x = torch.cat((x_resize, res), dim=1)
+            x = convnext(x, cond_vec)
+            x = convnext2(x, cond_vec)
+            x = attn(x)
+            x = upsample(x)
+
+        return self.final_conv(resize(x, out_shape=initial_shape))
+
+# --------------使用全局感受野网络+局部感受野网络合并的方式------------------#
+class DetailedNextNet(nn.Module):
+    def __init__(self, in_channels=3, depth=16, filters_per_layer=64):
+        super(DetailedNextNet,self).__init__()
+        
+        dims        = [filters_per_layer] * depth
+        emb_dim     = dims[0]
+        self.depth  = depth
+        self.layers = nn.ModuleList([])
+
+        # First block doesn't have a normalization layer
+        self.layers.append(ConvNextBlock(in_channels, dims[0], emb_dim=emb_dim, norm=False))
+
+        # Add the rest of the blocks
+        for i in range(1, math.ceil(self.depth / 2)):
+            self.layers.append(ConvNextBlock(dims[i - 1], dims[i], emb_dim=emb_dim, norm=True))
+        for i in range(math.ceil(self.depth / 2), depth):
+            self.layers.append(ConvNextBlock(2 * dims[i - 1],  dims[i], emb_dim=emb_dim, norm=True))
+
+    def forward(self, x, cond_vec):
+        residuals = []
+        for layer in self.layers[0: math.ceil(self.depth / 2)]:
+            x = layer(x, cond_vec)
+            residuals.append(x)
+
+        for layer in self.layers[math.ceil(self.depth / 2) : self.depth]:
+            x = torch.cat((x, residuals.pop()), dim=1)
+            x = layer(x, cond_vec)
+
+        return x
+
+class SemanticUnet(nn.Module):
+    def __init__(self, dim=64, dim_mults=(1, 2, 4, 4), channels = 3):
+        super(SemanticUnet,self).__init__()
+        
+        dims   = [channels, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        self.downs = nn.ModuleList([])
+        self.ups   = nn.ModuleList([])
+        num_resolutions = len(in_out)
+
+        # encoder ---------------------------------------
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.downs.append(nn.ModuleList([
+                ConvNextBlock(dim_in, dim_out,  emb_dim=dim, norm =ind != 0),
+                ConvNextBlock(dim_out, dim_out, emb_dim=dim),
+                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Downsample(dim_out) if not is_last else nn.Identity()
+            ]))
+
+        # middle ---------------------------------------
+        mid_dim = dims[-1]
+        self.mid_block1 = ConvNextBlock(mid_dim, mid_dim, emb_dim=dim)
+        self.mid_attn   = Residual(PreNorm(mid_dim, Attention(mid_dim, heads=4, dim_head=32)))
+        self.mid_block2 = ConvNextBlock(mid_dim, mid_dim, emb_dim=dim)
+
+        # decoder---------------------------------------
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (num_resolutions - 1)
+            self.ups.append(nn.ModuleList([
+                ConvNextBlock(dim_out * 2, dim_in, emb_dim=dim),
+                ConvNextBlock(dim_in, dim_in, emb_dim=dim),
+                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Upsample(dim_in) if not is_last else nn.Identity()
+            ]))
+
+    def forward(self, x, cond_vec):
+        initial_shape = x.shape[-2:]
+        h = []
+
+        # encoder ---------------------------------------
+        for convnext, convnext2, attn, downsample in self.downs:
+            x = convnext(x,  cond_vec)
+            x = convnext2(x, cond_vec)
+            x = attn(x)
+            h.append(x)
+            x = downsample(x)
+
+        # middle ---------------------------------------
+        x = self.mid_block1(x, cond_vec)
+        x = self.mid_attn(x)
+        x = self.mid_block2(x, cond_vec)
+
+        # decoder---------------------------------------
+        for convnext, convnext2, attn, upsample in self.ups:
+            res = h.pop()
+            x_resize = resize(x, out_shape=res.shape[-2:])
+            x = torch.cat((x_resize, res), dim=1)
+            x = convnext(x, cond_vec)
+            x = convnext2(x, cond_vec)
+            x = attn(x)
+            x = upsample(x)
+
+        x = resize(x, out_shape=initial_shape)
+        return x
+        
+
+class DiffusionBiSeNet(nn.Module):
+    def __init__(self, in_channels=3, detail_depth=16, dim=32, semantic_mults=(1, 2, 4, 4), device = None):
+        super(DiffusionBiSeNet, self).__init__()
+        
+        self.device   = device
+        
+        # detail branch
+        self.nextnet  = DetailedNextNet(in_channels, detail_depth, dim)
+        
+        # semantic branch
+        self.unet     = SemanticUnet(dim, semantic_mults, in_channels)
+        
+        # union branch
+        self.nextnet_final = nn.Conv2d(dim, in_channels, 1)
+        self.unet_final    = nn.Sequential(ConvNextBlock(dim, dim), 
+                                           nn.Conv2d(dim, 3, 1),)
+        
+        # Encoder for positional embedding of timestep
+        self.SinEmbTime  = SinusoidalPosEmb(dim)
+        self.SinEmbScale = SinusoidalPosEmb(dim)
+        self.time_mlp    = nn.Sequential(nn.Linear(dim * 2, dim * 4),
+                                         nn.GELU(),
+                                         nn.Linear(dim * 4, dim),)
+
+    def forward(self, x, time, scale=None):
+        scale_tensor = torch.ones(size=time.shape).to(device=self.device) * scale
+        t = self.SinEmbTime(time)
+        s = self.SinEmbScale(scale_tensor)
+        t_s_vec  = torch.cat((t, s), dim=1)
+        cond_vec = self.time_mlp(t_s_vec)
+
+        if scale > 0:
+            detail_feat = self.nextnet(x, cond_vec)
+            x_nextnet   = self.nextnet_final(detail_feat)
+            return x_nextnet
+        else:
+            semantic_feat = self.unet(x, cond_vec)
+            x_unet        = self.unet_final(semantic_feat)
+            return x_unet
 
 
+# ------------------------------------------------------------------------
 class MultiScaleGaussianDiffusion(nn.Module):
     def __init__(
             self,
@@ -262,9 +558,9 @@ class MultiScaleGaussianDiffusion(nn.Module):
         # calculations for diffusion q(x_t | x_{t-1}) and others
         self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
         self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
-        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod)))
-        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod)))
-        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod - 1)))
+        self.register_buffer('log_one_minus_alphas_cumprod',  to_torch(np.log(1. - alphas_cumprod)))
+        self.register_buffer('sqrt_recip_alphas_cumprod',     to_torch(np.sqrt(1. / alphas_cumprod)))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod',   to_torch(np.sqrt(1. / alphas_cumprod - 1)))
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
@@ -272,10 +568,8 @@ class MultiScaleGaussianDiffusion(nn.Module):
         self.register_buffer('posterior_variance', to_torch(posterior_variance))
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
         self.register_buffer('posterior_log_variance_clipped', to_torch(np.log(np.maximum(posterior_variance, 1e-20))))
-        self.register_buffer('posterior_mean_coef1', to_torch(
-            betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
-        self.register_buffer('posterior_mean_coef2', to_torch(
-            (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
+        self.register_buffer('posterior_mean_coef1', to_torch(betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)))
+        self.register_buffer('posterior_mean_coef2', to_torch((1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod)))
 
         sigma_t = np.sqrt(1. - alphas_cumprod) / np.sqrt(alphas_cumprod) # sigma_t = sqrt_one_minus_alphas_cumprod_div_sqrt_alphas_cumprod
 
@@ -536,8 +830,8 @@ class MultiScaleGaussianDiffusion(nn.Module):
 
         if self.clip_mask is not None:
             if s > 0:
-                mul_size = [int(self.image_sizes[s][0]* self.scale_mul[0]), int(self.image_sizes[s][1]* self.scale_mul[1])]
-                self.clip_mask = F.interpolate(self.clip_mask, size=mul_size, mode='bilinear')
+                mul_size          = [int(self.image_sizes[s][0]* self.scale_mul[0]), int(self.image_sizes[s][1]* self.scale_mul[1])]
+                self.clip_mask    = F.interpolate(self.clip_mask, size=mul_size, mode='bilinear')
                 self.x_recon_prev = F.interpolate(self.x_recon_prev, size=mul_size, mode='bilinear')
             else:  # mask created at scale 0 is usually too noisy
                 self.clip_mask = None
@@ -562,13 +856,14 @@ class MultiScaleGaussianDiffusion(nn.Module):
         """
         if custom_sample:
             if custom_img_size_idx >= self.n_scales:  # extrapolate size
-                size = self.image_sizes[self.n_scales-1]
+                size   = self.image_sizes[self.n_scales-1]
                 factor = self.scale_factor ** (custom_img_size_idx + 1 - self.n_scales)
-                size = (int(size[0] * factor), int(size[1] * factor))
+                size   = (int(size[0] * factor), int(size[1] * factor))
             else:
                 size = self.image_sizes[custom_img_size_idx]
         else:
             size = self.image_sizes[s]
+        
         image_size = (int(size[0] * scale_mul[0]), int(size[1] * scale_mul[1]))
         if custom_image_size is not None:  # force custom image size
             image_size = custom_image_size
@@ -590,8 +885,7 @@ class MultiScaleGaussianDiffusion(nn.Module):
 
         if int(s) > 0:
             cur_gammas = self.gammas[s - 1].reshape(-1)
-            x_mix = extract(cur_gammas, t, x_start.shape) * x_start + \
-                    (1 - extract(cur_gammas, t, x_start.shape)) * x_orig  # mix blurred and orig
+            x_mix   = extract(cur_gammas, t, x_start.shape) * x_start + (1 - extract(cur_gammas, t, x_start.shape)) * x_orig  # mix blurred and orig
             x_noisy = self.q_sample(x_start=x_mix, t=t, noise=noise)  # add noise
             x_recon = self.denoise_fn(x_noisy, t, s)
 
@@ -621,12 +915,13 @@ class MultiScaleGaussianDiffusion(nn.Module):
 
     def forward(self, x, s, *args, **kwargs):
         if int(s) > 0:  # no deblurring in scale=0
-            x_orig = x[0]
+            x_orig  = x[0]
             x_recon = x[1]
             b, c, h, w = x_orig.shape
-            device = x_orig.device
+            device   = x_orig.device
             img_size = self.image_sizes[s]
-            assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
+            # Tim 先不考虑分辨率的问题，因为使用了Large Crop 
+            #assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
             t = torch.randint(0, self.num_timesteps_trained[s], (b,), device=device).long()
             return self.p_losses(x_recon, t, s, x_orig=x_orig, *args, **kwargs)
 
@@ -635,7 +930,8 @@ class MultiScaleGaussianDiffusion(nn.Module):
             b, c, h, w = x[0].shape
             device = x[0].device
             img_size = self.image_sizes[s]
-            assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
+            # Tim 先不考虑分辨率的问题，因为使用了Large Crop 
+            #assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
             t = torch.randint(0, self.num_timesteps_trained[s], (b,), device=device).long()
             return self.p_losses(x[0], t, s, *args, **kwargs)
 

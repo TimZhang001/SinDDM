@@ -1,0 +1,25 @@
+scope:all_sample
+mode:train
+augment:0
+dataset_folder:./datasets/mvtec/grid/metal_contamination/
+image_name:None
+results_folder:./results/
+image_size:[256, 256]
+dim:320
+scale_factor:1.411
+timesteps:100
+train_batch_size:8
+grad_accumulate:1
+train_num_steps:30000
+save_sample_every:1000
+avg_window:100
+train_lr:0.0005
+sched_k_milestones:[5, 10, 17, 20, 22, 27]
+load_milestone:0
+sample_batch_size:16
+scale_mul:[1, 1]
+sample_t_list:None
+device_num:5
+sample_limited_t:False
+omega:0
+loss_factor:1
