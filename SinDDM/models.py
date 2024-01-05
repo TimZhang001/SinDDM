@@ -57,6 +57,7 @@ class SinDDMConvBlock(nn.Module):
 
         self.time_reshape = nn.Conv2d(time_emb_dim, dim, 1)
         self.ds_conv = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
+        #self.ds_conv = nn.Conv2d(dim, dim, 7, padding=3, groups=dim)
     
         self.net = nn.Sequential(
             nn.Conv2d(dim, dim_out * mult, 3, padding=1),
@@ -879,9 +880,10 @@ class MultiScaleGaussianDiffusion(nn.Module):
                 extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, s, noise=None, x_orig=None):
+    def p_losses(self, x_start, t, s, noise=None, x_orig=None, x_mask = None):
         b, c, h, w = x_start.shape
-        noise = default(noise, lambda: torch.randn_like(x_start))
+        noise   = default(noise, lambda: torch.randn_like(x_start))
+        results = []
 
         if int(s) > 0:
             cur_gammas = self.gammas[s - 1].reshape(-1)
@@ -893,45 +895,100 @@ class MultiScaleGaussianDiffusion(nn.Module):
             x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
             x_recon = self.denoise_fn(x_noisy, t, s)
 
-        if self.loss_type == 'l1':
-            loss = (noise - x_recon).abs().mean()
-        elif self.loss_type == 'l2':
-            loss = F.mse_loss(noise, x_recon)
+        if self.loss_type == 'l1' or self.loss_type == 'l2':
+            loss, results = self.cal_loss(noise, recon = x_recon, x_mask = x_mask, scale = s, weight=None)
         elif self.loss_type == 'l1_pred_img':
             if int(s) > 0:
                 cur_gammas = self.gammas[s - 1].reshape(-1)
                 if t[0]>0:
-                    x_mix_prev = extract(cur_gammas, t-1, x_start.shape) * x_start + \
-                            (1 - extract(cur_gammas, t-1, x_start.shape)) * x_orig  # mix blurred and orig
+                    x_mix_prev = extract(cur_gammas, t-1, x_start.shape) * x_start + (1 - extract(cur_gammas, t-1, x_start.shape)) * x_orig  # mix blurred and orig
                 else:
                     x_mix_prev = x_orig
             else:
                 x_mix_prev = x_start
             loss = (x_mix_prev-x_recon).abs().mean()
+            results['loss'] = loss
         else:
             raise NotImplementedError()
 
+        return loss, results
+    
+    # -----------cal loss ----------------
+    def cal_loss(self, noise, recon, x_mask= None, scale = 0, weight=None):
+        results    = {}
+        loss       = 0
+
+        #-------------------------------------------------------------------------------
+        # 定义权重
+        if weight is None:
+            if scale ==2:
+                weight = dict({'fg': 0, 'bg':  0, 'image': 1})
+            else:
+                weight = dict({'fg': 0, 'bg':  0, 'image': 1})
+
+        # 计算前景和背景的loss
+        if weight['fg'] > 0:
+            loss_fg       = self.cal_region_loss(recon, noise, x_mask, type='fg') * weight['fg']  
+            loss          = loss + loss_fg
+            results['fg'] = loss_fg.item()
+
+        if weight['bg'] > 0:
+            loss_bg       = self.cal_region_loss(recon, noise, x_mask, type='bg') * weight['bg']
+            loss          = loss + loss_bg
+            results['bg'] = loss_bg.item()
+        
+        if weight['image'] > 0:
+            loss_image       = self.cal_region_loss(recon, noise, x_mask, type='image') * weight['image']
+            loss             = loss + loss_image
+            results['image'] = loss_image.item()
+
+        # 返回loss
+        results['loss'] = loss.item()
+        return loss, results
+     
+    
+    def cal_region_loss(self, recon, noise, mask, type='fg'):
+        if type == 'fg':
+            inner_mask = mask
+        elif type == 'bg':
+            inner_mask = 1 - mask
+        else:
+            inner_mask = torch.ones_like(mask)
+        
+        recon = recon * inner_mask.float()
+        noise = noise * inner_mask.float()
+
+        # cal diffusion loss
+        if self.loss_type == 'l2':
+            loss = F.mse_loss(noise.float(), recon.float(), reduction='sum')
+        else:
+            loss = (noise - recon).abs().sum()
+        loss = loss / (self.channels * inner_mask.sum())
+
         return loss
+ 
 
     def forward(self, x, s, *args, **kwargs):
         if int(s) > 0:  # no deblurring in scale=0
             x_orig  = x[0]
             x_recon = x[1]
+            x_mask  = x[2]
             b, c, h, w = x_orig.shape
             device   = x_orig.device
             img_size = self.image_sizes[s]
             # Tim 先不考虑分辨率的问题，因为使用了Large Crop 
             #assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
             t = torch.randint(0, self.num_timesteps_trained[s], (b,), device=device).long()
-            return self.p_losses(x_recon, t, s, x_orig=x_orig, *args, **kwargs)
+            return self.p_losses(x_recon, t, s, x_orig=x_orig, x_mask = x_mask, *args, **kwargs)
 
         else:
 
             b, c, h, w = x[0].shape
             device = x[0].device
+            x_mask = x[2]
             img_size = self.image_sizes[s]
             # Tim 先不考虑分辨率的问题，因为使用了Large Crop 
             #assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
             t = torch.randint(0, self.num_timesteps_trained[s], (b,), device=device).long()
-            return self.p_losses(x[0], t, s, *args, **kwargs)
+            return self.p_losses(x[0], t, s, x_mask = x_mask, *args, **kwargs)
 

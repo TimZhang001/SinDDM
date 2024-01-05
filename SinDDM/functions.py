@@ -8,7 +8,7 @@ from pathlib import Path
 import glob
 import os
 import shutil
-
+import cv2
 
 try:
     from apex import amp
@@ -129,7 +129,8 @@ def cosine_beta_schedule(timesteps, s=0.008):
     return np.clip(betas, a_min=0, a_max=0.999)
 
 
-def create_img_scales(foldername, filename, scale_factor=1.411, image_size=None, create=False, auto_scale=None):
+def create_img_scales(foldername, filename, scale_factor=1.411, image_size=None, create=False, auto_scale=None,
+                      area_scale_0=3110, scale_0_dim_min=42, scale_0_dim_max=55):
     """
     Receives path to the desired training image and scale_factor that defines the downsampling rate.
     optional argument image_size can be given to reshape the original training image.
@@ -160,14 +161,21 @@ def create_img_scales(foldername, filename, scale_factor=1.411, image_size=None,
         elif os.path.isdir(file_path) and create:
             shutil.rmtree(file_path)
 
+    sizes               = []
     rescale_losses_list = []
     for filename in image_files:
     
+        # image_name and mask name
+        image_name = foldername + filename
+        mask_name  = image_name.replace('/test/', '/ground_truth/').replace('.png', '_mask.png')
+        
         # load image
-        orig_image = Image.open(foldername + filename).convert('RGB')
+        orig_image = Image.open(image_name).convert('RGB')
+        mask_image = Image.open(mask_name).convert('L')
 
         # 默认分辨率为image_size
         orig_image = orig_image.resize(image_size, Image.LANCZOS)
+        mask_image = mask_image.resize(image_size, Image.LANCZOS)
 
         # convert to PNG extension for lossless conversion
         filename = filename.rsplit( ".", 1 )[ 0 ] + '.png'
@@ -184,28 +192,37 @@ def create_img_scales(foldername, filename, scale_factor=1.411, image_size=None,
 
         # auto resize
         # rf_net = 35
-        area_scale_0 = 3110  # defined such that rf_net^2/area_scale0 ~= 40% 感受野面积占原图的40%
-        #area_scale_0 = 1742  # defined such that rf_net^2/area_scale0 ~= 70% 感受野面积占原图的70%
         #area_scale_0 = 4096  # defined such that rf_net^2/area_scale0 ~= 70% 感受野面积占原图的70%
         s_dim        = min(image_size[0], image_size[1])
         l_dim        = max(image_size[0], image_size[1])
         scale_0_dim  = int(round(np.sqrt(area_scale_0*s_dim/l_dim)))
         
         # clamp between 42 and 55
-        scale_0_dim   = 42 if scale_0_dim < 42 else (55 if scale_0_dim > 55 else scale_0_dim )
+        scale_0_dim   = scale_0_dim_min if scale_0_dim < scale_0_dim_min else (scale_0_dim_max if scale_0_dim > scale_0_dim_max else scale_0_dim )
         small_val     = scale_0_dim
         min_val_image = min(image_size[0], image_size[1])
         n_scales      = int(round( (np.log(min_val_image/small_val)) / (np.log(scale_factor)) ) + 1)
         scale_factor  = np.exp((np.log(min_val_image / small_val)) / (n_scales - 1))
 
         for i in range(n_scales):
-            cur_size = (int(round(image_size[0] / np.power(scale_factor, n_scales - i - 1))),
-                        int(round(image_size[1] / np.power(scale_factor, n_scales - i - 1))))
-            cur_img = orig_image.resize(cur_size, Image.LANCZOS)
+            cur_size = (int(round(image_size[0] / np.power(scale_factor, n_scales - i - 1))), int(round(image_size[1] / np.power(scale_factor, n_scales - i - 1))))
+            cur_img  = orig_image.resize(cur_size, Image.LANCZOS)
+            cur_mask = mask_image.resize(cur_size, Image.NEAREST)
+                        
+            # dilate mask
+            image_mask = np.array(cur_mask)
+            image_disk = cv2.getStructuringElement(cv2.MORPH_RECT, (int(3*n_scales), int(3*n_scales)))
+            image_mask = cv2.dilate(image_mask, image_disk)
+            cur_mask   = Image.fromarray(image_mask)
+
+            # convert to binary mask
+            cur_mask = cur_mask.point(lambda x: 0 if x < 255 else 255, '1')
+
             path_to_save = save_foldername + 'scale_' + str(i) + '/'
             if create:
                 Path(path_to_save).mkdir(parents=True, exist_ok=True)
                 cur_img.save(path_to_save + filename)
+                cur_mask.save(path_to_save + filename.replace('.png', '_mask.png'))
             downscaled_images.append(cur_img)
             sizes.append(cur_size)
         for i in range(n_scales - 1):
@@ -213,9 +230,9 @@ def create_img_scales(foldername, filename, scale_factor=1.411, image_size=None,
             recon_images.append(recon_image)
             rescale_losses.append(np.linalg.norm(np.subtract(downscaled_images[i + 1], recon_image)) / np.asarray(recon_image).size)
             if create:
-                path_to_save = save_foldername + 'scale_' + str(i + 1) + '_recon/'
+                path_to_save = save_foldername + 'scale_' + str(i + 1)
                 Path(path_to_save).mkdir(parents=True, exist_ok=True)
-                recon_image.save(path_to_save + filename)
+                recon_image.save(path_to_save + filename.replace('.png', '_recon.png'))
 
         rescale_losses_list.append(rescale_losses)
     
@@ -224,95 +241,21 @@ def create_img_scales(foldername, filename, scale_factor=1.411, image_size=None,
     return sizes, rescale_losses, scale_factor, n_scales
 
 
-def create_img_scales_new(foldername, filename, scale_factor=1.411, image_size=None, create=False, auto_scale=None):
-    """
-    Receives path to the desired training image and scale_factor that defines the downsampling rate.
-    optional argument image_size can be given to reshape the original training image.
-    optional argument auto_scale - limits the training image to have a given #pixels.
-    The function creates the downsampled and upsampled blurry versions of the training image.
-    Calculates n_scales such that RF area is ~40% of the smallest scale area with the given scale_factor.
-    Also calculates the MSE loss between upsampled/downsampled images for starting T calculation (see paper).
 
+class AverageValueMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
 
-    returns:
-            sizes: list of image sizes for each scale
-            rescale_losses: list of MSE losses between US/DS images for each scale
-            scale_factor: modified scale_factor to allow 40% area ratio
-    """
-    
-    if filename is None:
-        image_files = [os.path.basename(x) for x in glob.glob(foldername + '*.png')]
-    else:
-        image_files = [foldername + '/' +filename]    
-    
-    # 创建临时文件夹，删除文件夹里面的所有文件和文件夹
-    save_foldername     = os.path.join(foldername, 'tmp/')
-    Path(save_foldername).mkdir(parents=True, exist_ok=True)
-    for file in os.listdir(save_foldername):
-        file_path = os.path.join(save_foldername, file)
-        if os.path.isfile(file_path) and create:
-            os.remove(file_path)
-        elif os.path.isdir(file_path) and create:
-            shutil.rmtree(file_path)
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0.0
 
-    rescale_losses_list = []
-    for filename in image_files:
-    
-        # load image
-        orig_image = Image.open(foldername + filename).convert('RGB')
-
-        # 默认分辨率为image_size
-        orig_image = orig_image.resize(image_size, Image.LANCZOS)
-
-        # convert to PNG extension for lossless conversion
-        filename = filename.rsplit( ".", 1 )[ 0 ] + '.png'
-        if image_size is None:
-            image_size = (orig_image.size)
-        if auto_scale is not None:
-            scaler = np.sqrt((image_size[0] * image_size[1])/auto_scale)
-            if scaler > 1:
-                image_size = (int(image_size[0]/scaler), int(image_size[1]/scaler))
-        sizes             = []
-        downscaled_images = []
-        recon_images      = []
-        rescale_losses    = []
-
-        # auto resize
-        # rf_net = 35
-        area_scale_0 = 4096  # defined such that rf_net^2/area_scale0 ~= 70% 感受野面积占原图的70%
-        s_dim        = min(image_size[0], image_size[1])
-        l_dim        = max(image_size[0], image_size[1])
-        scale_0_dim  = int(round(np.sqrt(area_scale_0*s_dim/l_dim)))
-        
-        # clamp between 42 and 55
-        scale_0_dim   = 42 if scale_0_dim < 42 else (64 if scale_0_dim > 64 else scale_0_dim )
-        small_val     = scale_0_dim
-        min_val_image = min(image_size[0], image_size[1])
-        n_scales      = int(round( (np.log(min_val_image/small_val)) / (np.log(scale_factor)) ) + 1)
-        scale_factor  = np.exp((np.log(min_val_image / small_val)) / (n_scales - 1))
-
-        for i in range(n_scales):
-            cur_size = (int(round(image_size[0] / np.power(scale_factor, n_scales - i - 1))),
-                        int(round(image_size[1] / np.power(scale_factor, n_scales - i - 1))))
-            cur_img = orig_image.resize(cur_size, Image.LANCZOS)
-            path_to_save = save_foldername + 'scale_' + str(i) + '/'
-            if create:
-                Path(path_to_save).mkdir(parents=True, exist_ok=True)
-                cur_img.save(path_to_save + filename)
-            downscaled_images.append(cur_img)
-            sizes.append(cur_size)
-        for i in range(n_scales - 1):
-            recon_image = downscaled_images[i].resize(sizes[i + 1], Image.BILINEAR)
-            recon_images.append(recon_image)
-            rescale_losses.append(np.linalg.norm(np.subtract(downscaled_images[i + 1], recon_image)) / np.asarray(recon_image).size)
-            if create:
-                path_to_save = save_foldername + 'scale_' + str(i + 1) + '_recon/'
-                Path(path_to_save).mkdir(parents=True, exist_ok=True)
-                recon_image.save(path_to_save + filename)
-
-        rescale_losses_list.append(rescale_losses)
-    
-    rescale_losses = np.mean(np.asarray(rescale_losses_list), axis=0)
-
-    return sizes, rescale_losses, scale_factor, n_scales
-
+    def update(self, val, n=1):
+        if val > 0:
+            self.val = val
+            self.sum += val * n
+            self.count += n
+            self.avg = self.sum / self.count

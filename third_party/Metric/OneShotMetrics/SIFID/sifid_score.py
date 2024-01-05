@@ -215,8 +215,8 @@ def calculate_sifid_given_paths(path1, path2, batch_size, cuda, dims):
     for i in range(len(files2)):
         m2, s2 = calculate_activation_statistics([files2[i]], model, batch_size, dims, cuda)
         fid_values.append(calculate_frechet_distance(m1, s1, m2, s2))
-        if i % 100 == 0:
-            print(i)
+        #if i % 100 == 0:
+        #    print(i)
     return fid_values
 
 

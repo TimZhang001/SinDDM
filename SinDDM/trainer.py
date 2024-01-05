@@ -24,6 +24,7 @@ from skimage.exposure import match_histograms
 from text2live_util.util import get_augmentations_template
 from tqdm import tqdm
 import random
+import cv2
 
 try:
     from apex import amp
@@ -42,10 +43,8 @@ class sinDDMDataset(Dataset):
         self.image_size  = image_size
         self.blurry_img  = blurry_img
         self.train_steps = train_num_steps
-        self.paths       = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
-        if blurry_img:
-            self.folder_recon = folder + '_recon/'
-            self.paths_recon  = [p for ext in exts for p in Path(f'{self.folder_recon}').glob(f'**/*.{ext}')]
+        
+        self.get_file_paths(folder, exts)
 
         # 没有使用任何复杂的扩充方法
         self.transform = transforms.Compose([
@@ -54,6 +53,21 @@ class sinDDMDataset(Dataset):
             transforms.Lambda(lambda t: (t * 2) - 1)
         ])
 
+    def get_file_paths(self, folder, exts=['jpg', 'jpeg', 'png']):
+        self.paths       = []
+        self.paths_recon = []
+        self.paths_mask  = []    
+        
+        image_files = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        for i in range(len(image_files)):
+            cur_path = str(image_files[i])
+            if cur_path.endswith('_mask.png'):
+                self.paths_mask.append(image_files[i])
+            elif cur_path.endswith('_recon.png'):
+                self.paths_recon.append(image_files[i]) 
+            else:
+                self.paths.append(image_files[i])
+    
     def __len__(self):
         return len(self.paths) * self.train_steps
 
@@ -64,6 +78,20 @@ class sinDDMDataset(Dataset):
         img       = Image.open(self.paths[index]).convert('RGB')
         trans_img = self.transform(img)
 
+        # mask image 
+        image_mask = Image.open(self.paths_mask[index]).convert('L')
+        image_mask = np.array(image_mask)
+
+        # 进行膨胀操作
+        image_disk = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        image_mask = cv2.dilate(image_mask, image_disk)
+
+        # convert 0-1 
+        image_mask = image_mask.astype(np.float32) / 255.0
+
+        # convert [H W]->[1, H, W]
+        image_mask = torch.from_numpy(image_mask).unsqueeze(0)
+
         # blurry image
         if self.blurry_img:
             img_recon   = Image.open(self.paths_recon[index]).convert('RGB')
@@ -71,7 +99,7 @@ class sinDDMDataset(Dataset):
         else:
             trans_recon = trans_img.clone()
         
-        return trans_img, trans_recon
+        return trans_img, trans_recon, image_mask
 
 
 class MultiscaleTrainer(object):
@@ -142,6 +170,10 @@ class MultiscaleTrainer(object):
         self.running_loss  = []
         self.running_scale = []
         self.avg_t         = []
+
+        self.loss_fg       = AverageValueMeter()
+        self.loss_bg       = AverageValueMeter()
+        self.loss_image    = AverageValueMeter()
 
         assert not fp16 or fp16 and APEX_AVAILABLE, 'Apex must be installed in order for mixed precision training to be turned on'
 
@@ -222,7 +254,7 @@ class MultiscaleTrainer(object):
         #aug_rgbShift    = albumentations.RGBShift(r_shift_limit=10, g_shift_limit=10, b_shift_limit=10, p=0.5)
 
         # crop
-        dst_h, dst_w    = int(image_size[0] * 0.85), int(image_size[1] * 0.85)
+        dst_h, dst_w    = int(image_size[0] * 0.90), int(image_size[1] * 0.90)
         aug_crop        = albumentations.RandomCrop(height=dst_h, width=dst_w, p=1)
         
         # 组合
@@ -240,6 +272,7 @@ class MultiscaleTrainer(object):
         out_data    = []
         image_list1 = []
         image_list2 = []
+        image_list3 = []
 
         # batch size
         for i in range(batch_data[0].shape[0]):
@@ -247,24 +280,30 @@ class MultiscaleTrainer(object):
             # 转化为numpy  [-1, 1] -- > [0, 1]处理
             image1 = np.transpose(batch_data[0][i].numpy(), (1, 2, 0))
             image2 = np.transpose(batch_data[1][i].numpy(), (1, 2, 0))
+            image3 = np.transpose(batch_data[2][i].numpy(), (1, 2, 0))
             image1 = (image1 + 1) * 0.5
             image2 = (image2 + 1) * 0.5
             
             # 进行数据增强
             self.get_image_augmentations(image1.shape[:2])
-            processed = self.augment_fun(image = image1, mask=image2)
+            image_concat = np.concatenate((image1, image2), axis=2)
+            processed    = self.augment_fun(image = image_concat, mask = image3)
             
             # [0, 1] --> [-1, 1]
-            image1 = (processed['image'] * 2) - 1
-            image2 = (processed['mask'] * 2) - 1
-            image1 = torch.from_numpy(np.transpose(image1, (2, 0, 1))).to(self.device)
-            image2 = torch.from_numpy(np.transpose(image2, (2, 0, 1))).to(self.device)
+            image_concat_ed = (processed['image'] * 2) - 1
+            image1 = image_concat_ed[:, :, :3]
+            image2 = image_concat_ed[:, :, 3:]
+            image1 = torch.from_numpy(np.transpose(image1, (2, 0, 1)))
+            image2 = torch.from_numpy(np.transpose(image2, (2, 0, 1)))
+            image3 = torch.from_numpy(np.transpose(processed['mask'], (2, 0, 1)))
             
             image_list1.append(image1)
             image_list2.append(image2)
+            image_list3.append(image3)
         
         out_data.append(torch.stack(image_list1))
         out_data.append(torch.stack(image_list2))
+        out_data.append(torch.stack(image_list3))
 
         return out_data
     
@@ -314,9 +353,9 @@ class MultiscaleTrainer(object):
 
     def train(self, augment=False):
 
-        backwards = partial(loss_backwards, self.fp16)
-        loss_avg  = 0
-        s_weights = torch.tensor(self.model.num_timesteps_trained, device=self.device, dtype=torch.float)
+        backwards   = partial(loss_backwards, self.fp16)
+        loss_avg    = 0
+        s_weights   = torch.tensor(self.model.num_timesteps_trained, device=self.device, dtype=torch.float)
 
         while self.step < self.train_num_steps:
 
@@ -335,14 +374,25 @@ class MultiscaleTrainer(object):
                     input_data[j] = input_data[j].to(self.device)
 
                 # forward pass    
-                loss      = self.model(input_data, s)
+                loss, reuslts  = self.model(input_data, s)
                 loss_avg += loss.item()
                 backwards(loss / self.gradient_accumulate_every, self.opt)
+                # 判定'loss_fg'是否在字典中
+                if 'fg' in reuslts.keys():
+                    self.loss_fg.update(reuslts['fg'], self.batch_size)
+                if 'bg' in reuslts.keys():
+                    self.loss_bg.update(reuslts['bg'], self.batch_size)
+                if 'image' in reuslts.keys():
+                    self.loss_image.update(reuslts['image'], self.batch_size)
 
             if self.step % self.avg_window == 0:
-                print(f'step:{self.step} loss:{loss_avg/self.avg_window} lr:{self.scheduler.get_last_lr()[0]}')
+                print(f'step:{self.step} loss:{loss_avg/self.avg_window} lr:{self.scheduler.get_last_lr()[0]} fg:{self.loss_fg.avg} image:{self.loss_image.avg}')
                 self.running_loss.append(loss_avg/self.avg_window)
                 loss_avg = 0
+                self.loss_fg.reset()
+                self.loss_bg.reset()
+                self.loss_image.reset()
+
             self.opt.step()
             self.opt.zero_grad()
 

@@ -1,25 +1,25 @@
 scope:single_image
 mode:sample_eval
 augment:0
-dataset_folder:./datasets/mvtec/screw/scratch_neck/
-image_name:None
+dataset_folder:./mvtecAD/screw/test/scratch_neck/
+image_name:000.png
 results_folder:./results/
 image_size:[256, 256]
 dim:160
 scale_factor:1.411
 timesteps:100
-train_batch_size:32
+train_batch_size:16
 grad_accumulate:1
-train_num_steps:18750
+train_num_steps:37500
 save_sample_every:1000
 avg_window:100
 train_lr:0.001
-sched_k_milestones:[3, 6, 10, 12, 14, 17]
+sched_k_milestones:[6, 12, 21, 25, 28, 34]
 load_milestone:18
-sample_batch_size:32
+sample_batch_size:12
 scale_mul:[1, 1]
 sample_t_list:None
-device_num:0
+device_num:1
 sample_limited_t:False
 omega:0
 loss_factor:1

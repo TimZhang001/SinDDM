@@ -48,8 +48,8 @@ def LPIPS(list_fake_image):
         for j in range(i + 1, len(lst_im))[:100]:
             dist_diversity += p_model.forward(lst_im[i], lst_im[j])
             count += 1
-            if count % 500 == 0:
-                print(count)
+            #if count % 500 == 0:
+            #    print(count)
     
 
     '''

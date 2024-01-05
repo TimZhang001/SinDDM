@@ -9,12 +9,11 @@ from SinDDM.trainer import MultiscaleTrainer
 from text2live_util.clip_extractor import ClipExtractor
 import time
 
-mvtectAD = "./datasets/mvtec/"
+mvtectAD = "./mvtecAD/"
 mvtectTexture = ["grid", "carpet", "leather", "tile", "wood"]
 mvtectObject1 = ["hazelnut", "bottle", "cable", "capsule",  ] # , 
-mvtectObject2 = ["screw", "metal_nut", "pill", "toothbrush", ] #  
-mvtectObject3 = ["transistor", "zipper"] #
-mvtectAll     = mvtectTexture + mvtectObject1 + mvtectObject2 + mvtectObject3  
+mvtectObject2 = ["screw", "metal_nut", "pill", "toothbrush", "transistor", "zipper"] #  
+mvtectAll     = mvtectTexture + mvtectObject1 + mvtectObject2  
 
 
 def parse_args():
@@ -22,38 +21,38 @@ def parse_args():
 
     parser.add_argument("--scope",   help='choose training scope.',      default='single_image')
     parser.add_argument("--mode",    help='choose mode: train, sample,', default='train') # train  sample
-    parser.add_argument("--augment", help='use data augmentation.',      default=0)
+    parser.add_argument("--augment", help='use data augmentation.',      default=1)
     
     # --------------------------------------------------------------------------------------------------
 
     # Dataset
-    parser.add_argument("--dataset_folder", help='choose dataset folder.', default='./datasets/mvtec/cable/cut_outer_insulation/')
+    parser.add_argument("--dataset_folder", help='choose dataset folder.', default='./mvtecAD/grid/thread/')
     parser.add_argument("--image_name",     help='choose image name.',     default=None)
-    parser.add_argument("--results_folder", help='choose results folder.', default='./results/')
+    parser.add_argument("--results_folder", help='choose results folder.', default='./results_nextnet/')
     parser.add_argument("--image_size",     help='choose image size.',     default=[256, 256])
 
     # Net
     parser.add_argument("--dim", help='widest channel dimension for conv blocks.', default=160, type=int)
     # diffusion params
-    parser.add_argument("--scale_factor", help='downscaling step for each scale.', default=1.411, type=float) # 1.411 1.732# 
+    parser.add_argument("--scale_factor", help='downscaling step for each scale.', default=2, type=float) # 1.411(sqrt(2)) 1.732(sqrt(3)) 2(sqrt(4)) 4# 
     # training params
     parser.add_argument("--timesteps",        help='total diffusion timesteps.',  default=100, type=int)
-    parser.add_argument("--train_batch_size", help='batch size during training.', default=32,  type=int)
+    parser.add_argument("--train_batch_size", help='batch size during training.', default=8,  type=int)
     parser.add_argument("--grad_accumulate",  help='gradient accumulation (bigger batches).', default=1, type=int)
     parser.add_argument("--train_num_steps",  help='total training steps.',       default=120001, type=int)  # 120001
     parser.add_argument("--save_sample_every",help='n. steps for checkpointing model.', default=1000, type=int) # 10000
     parser.add_argument("--avg_window",       help='window size for averaging loss (visualization only).', default=100, type=int)
     parser.add_argument("--train_lr",         help='starting lr.', default=1e-3, type=float)
     parser.add_argument("--sched_k_milestones", nargs="+", help='lr scheduler steps x 1000.', default=[20, 40, 70, 80, 90, 110], type=int)
-    parser.add_argument("--load_milestone",   help='load specific milestone.', default=17, type=int)
+    parser.add_argument("--load_milestone",   help='load specific milestone.', default=0, type=int)
     
     # sampling params
-    parser.add_argument("--sample_batch_size", help='batch size during sampling.', default=16, type=int)
+    parser.add_argument("--sample_batch_size", help='batch size during sampling.', default=8, type=int)
     parser.add_argument("--scale_mul",         help='image size retargeting modifier.', nargs="+", default=[1, 1], type=float)
     parser.add_argument("--sample_t_list",     nargs="+", help='Custom list of timesteps corresponding to each scale (except scale 0).', type=int)
     
     # device num
-    parser.add_argument("--device_num",        help='use specific cuda device.', default=4, type=int)
+    parser.add_argument("--device_num",        help='use specific cuda device.', default=6, type=int)
 
     # DEV. params - do not modify
     parser.add_argument("--sample_limited_t", help='limit t in each scale to stop at the start of the next scale', action='store_true')
@@ -61,8 +60,8 @@ def parse_args():
     parser.add_argument("--loss_factor",      help='ratio between MSE loss and starting diffusion step for each scale.', default=1, type=float)
 
     args = parser.parse_args()
-    args.train_num_steps    = int(args.train_num_steps * 5 / args.train_batch_size) 
-    args.sched_k_milestones = [int(val * 5 / args.train_batch_size) for val in args.sched_k_milestones]
+    args.train_num_steps    = int(args.train_num_steps * 1 / args.train_batch_size) 
+    args.sched_k_milestones = [int(val * 1 / args.train_batch_size) for val in args.sched_k_milestones]
 
     return args
 
@@ -80,7 +79,7 @@ def print_save_params(args):
     # 获取dataset_folder的最后两个文件夹
     folder_list = args.dataset_folder.rstrip('/')
     folder_list = folder_list.split('/')
-    save_path   = os.path.join(args.results_folder, folder_list[-2], folder_list[-1], args.scope)
+    save_path   = os.path.join(args.results_folder, folder_list[-3], folder_list[-1], args.scope)
     os.makedirs(save_path, exist_ok=True)
     with open(os.path.join(save_path, 'args.txt'), 'w') as f:
         for k, v in vars(args).items():
@@ -95,7 +94,8 @@ def train_sample_models(args, save_path):
     sched_milestones = [val * 1000 for val in args.sched_k_milestones] # 1000
     
     # set to true to save all intermediate diffusion timestep results
-    save_interm    = True if args.mode == 'sample' else False
+    #save_interm    = True if args.mode == 'sample' else False
+    save_interm    = False
     save_unbatched = False
     channels       = 3
     create         = False if args.mode == 'sample' else True
@@ -105,12 +105,14 @@ def train_sample_models(args, save_path):
                                                                       image_size=args.image_size,
                                                                       create=create,
                                                                       auto_scale=100000, # limit max number of pixels in image
-                                                                      )
+                                                                      area_scale_0=4096, 
+                                                                      scale_0_dim_min=42, 
+                                                                      scale_0_dim_max=64)
 
-    model = SinDDMNet(dim=args.dim, multiscale=True, device=device, channels=channels,)    
+    #model = SinDDMNet(dim=args.dim, multiscale=True, device=device, channels=channels,)    
     #model = Unet(dim=int(args.dim/8), channels=channels, dim_mults=(1, 2, 4, 4), device=device)
-    #model = NextNet(in_channels= channels, out_channels=channels, depth=16, filters_per_layer=64, device=device)
-    #model = DiffusionBiSeNet(in_channels=channels, detail_depth=16, dim=64, semantic_mults=(1,2,2), device=device)
+    model = NextNet(in_channels= channels, out_channels=channels, depth=16, filters_per_layer=64, device=device)
+    #model = DiffusionBiSeNet(in_channels=channels, detail_depth=16, dim=32, semantic_mults=(1,2,2), device=device)
     model.to(device)
 
     ms_diffusion = MultiScaleGaussianDiffusion(
@@ -199,13 +201,13 @@ def train_sample_models(args, save_path):
 def train_sample_all():     
     
     # mvtectTexture mvtectObject1 mvtectObject2 mvtectObject3
-    for target in mvtectObject3:
-        target_path      = os.path.join(mvtectAD, target)
+    for target in mvtectTexture:
+        target_path      = os.path.join(mvtectAD, target, "test")
         file_names       = os.listdir(target_path)
 
         for file_name in file_names:
-            #if file_name == "good" or file_name == "tmp":
-            #    continue
+            if file_name == "good" or file_name == "tmp":
+                continue
 
             args.dataset_folder = os.path.join(target_path, file_name) + '/'
             args.image_name     = '000.png'
@@ -225,6 +227,9 @@ def train_sample_all():
        
 # ------------------------------------------------------------------------- #
 def main():
+    target_path = os.path.join(mvtectAD, "grid", "test")
+    args.dataset_folder = os.path.join(target_path, "thread") + '/'
+    args.image_name     = '000.png'
     save_path = print_save_params(args)
     train_sample_models(args, save_path)
 

@@ -61,10 +61,12 @@ def get_image_names(args):
     names_real_image = sorted(os.listdir(path_real_images))
     list_real_image  = list()
     im_res = (ToTensor()(list_fake_image[0]).shape[2], ToTensor()(list_fake_image[0]).shape[1])
+    print("fake im_res: ", im_res)
     for i in range(len(names_real_image)):
         im_path          = os.path.join(path_real_images, names_real_image[i])
         im               = (Image.open(im_path).convert("RGB"))
-        list_real_image += [im.resize(im_res, Image.BILINEAR)]
+        print("true im_res: ", im.size)
+        list_real_image += [im.resize(im_res, Image.Resampling.LANCZOS)]
 
     return names_real_image, names_fake_image, list_real_image, list_fake_image, im_res
 
